@@ -1,0 +1,21 @@
+# Visual Studio / .NET Core / WPF
+/[Bb]in/
+/[Oo]bj/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Wyniki publikacji i buildów
+[Oo]bj/
+[Bb]in/
+[Ll]og/
+[Ll]ogs/
+
+# Pliki użytkownika systemu operacyjnego
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
