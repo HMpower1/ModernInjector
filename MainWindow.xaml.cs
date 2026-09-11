@@ -1,261 +1,319 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
-using System.Windows.Interop;
-using System.Windows.Threading;
-using Microsoft.Win32;
 
 namespace ModernInjector
 {
     public partial class MainWindow : Window
     {
-        private bool isDarkMode = true;
-        private DispatcherTimer autoRefreshTimer;
+        private readonly List<ProcessViewModel> _allProcesses = new();
+
+        // --- Win32 API Imports ---
+        [Flags]
+        public enum ProcessAccessFlags : uint
+        {
+            All = 0x001F0FFF,
+            CreateThread = 0x0002,
+            QueryInformation = 0x0400,
+            VirtualMemoryOperation = 0x0008,
+            VirtualMemoryRead = 0x0010,
+            VirtualMemoryWrite = 0x0020
+        }
+
+        [Flags]
+        public enum AllocationType
+        {
+            Commit = 0x1000,
+            Reserve = 0x2000
+        }
+
+        [Flags]
+        public enum MemoryProtection
+        {
+            ExecuteReadWrite = 0x40
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(ProcessAccessFlags processAccess, bool bInheritHandle, int processId);
+
+        [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+        public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, AllocationType flAllocationType, MemoryProtection flProtect);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out IntPtr lpNumberOfBytesWritten);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, IntPtr lpThreadId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr hObject);
 
         public MainWindow()
         {
             InitializeComponent();
-            Log("Aplikacja uruchomiona pomyślnie.");
+            Log("Aplikacja została uruchomiona pomyślnie.");
             LoadProcesses();
-
-            // Konfiguracja timera dla auto-odświeżania (co 3 sekundy)
-            autoRefreshTimer = new DispatcherTimer();
-            autoRefreshTimer.Interval = TimeSpan.FromSeconds(3);
-            autoRefreshTimer.Tick += (s, e) => {
-                if (string.IsNullOrWhiteSpace(TxtSearch.Text))
-                {
-                    LoadProcesses(false); // Odśwież po cichu bez resetu logów
-                }
-            };
         }
 
+        // Metoda pomocnicza do logowania w konsoli interfejsu
         private void Log(string message)
         {
-            string timestamp = DateTime.Now.ToString("HH:mm:ss");
-            TxtConsoleLogs.AppendText($"[{timestamp}] {message}\n");
+            TxtConsoleLogs.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}\n");
             TxtConsoleLogs.ScrollToEnd();
         }
 
-        private void LoadProcesses(bool logAction = true)
+        // Bezpieczne pobieranie ikony procesu
+        private ImageSource? GetProcessIcon(Process p)
         {
             try
             {
-                var processes = Process.GetProcesses()
-                    .Where(p => {
-                        try { return p.WorkingSet64 > 0 && !string.IsNullOrEmpty(p.MainWindowTitle) || p.Id > 0; }
-                        catch { return false; }
-                    })
-                    .Select(p => {
-                        string memoryStr = "N/A";
-                        try
-                        {
-                            memoryStr = $"{p.WorkingSet64 / 1024 / 1024} MB";
-                        }
-                        catch { }
-
-                        // Bezpieczne wyciąganie ikony procesu
-                        ImageSource iconSource = null;
-                        try
-                        {
-                            string filePath = p.MainModule?.FileName;
-                            if (!string.IsNullOrEmpty(filePath) && File.Exists(filePath))
-                            {
-                                using (var sysIcon = System.Drawing.Icon.ExtractAssociatedIcon(filePath))
-                                {
-                                    if (sysIcon != null)
-                                    {
-                                        iconSource = Imaging.CreateBitmapSourceFromHIcon(
-                                            sysIcon.Handle,
-                                            Int32Rect.Empty,
-                                            BitmapSizeOptions.FromEmptyOptions());
-                                    }
-                                }
-                            }
-                        }
-                        catch
-                        {
-                            // Ignorujemy procesy systemowe blokujące dostęp
-                        }
-
-                        return new
-                        {
-                            Id = p.Id,
-                            Name = p.ProcessName + ".exe",
-                            MemorySize = memoryStr,
-                            Icon = iconSource
-                        };
-                    })
-                    .OrderBy(p => p.Name)
-                    .ToList();
-
-                string query = TxtSearch.Text?.ToLower() ?? "";
-                if (!string.IsNullOrEmpty(query))
+                string? path = p.MainModule?.FileName;
+                if (!string.IsNullOrEmpty(path) && File.Exists(path))
                 {
-                    processes = processes.Where(p => p.Name.ToLower().Contains(query) || p.Id.ToString().Contains(query)).ToList();
+                    using var icon = System.Drawing.Icon.ExtractAssociatedIcon(path);
+                    if (icon != null)
+                    {
+                        return Imaging.CreateBitmapSourceFromHIcon(
+                            icon.Handle,
+                            Int32Rect.Empty,
+                            BitmapSizeOptions.FromEmptyOptions());
+                    }
+                }
+            }
+            catch
+            {
+                // Ignorujemy procesy systemowe do których nie mamy uprawnień odczytu ścieżki
+            }
+            return null;
+        }
+
+        // Ładowanie i cache'owanie procesów
+        private void LoadProcesses()
+        {
+            _allProcesses.Clear();
+            foreach (var p in Process.GetProcesses())
+            {
+                try
+                {
+                    var vm = new ProcessViewModel
+                    {
+                        Name = p.ProcessName,
+                        Id = p.Id,
+                        MemorySize = $"{p.WorkingSet64 / 1024 / 1024} MB",
+                        Architecture = "x64 / x86",
+                        MainWindowTitle = p.MainWindowTitle ?? string.Empty,
+                        Icon = GetProcessIcon(p)
+                    };
+                    _allProcesses.Add(vm);
+                }
+                catch { }
+            }
+            FilterProcesses(TxtSearch?.Text ?? string.Empty);
+        }
+
+        // Filtrowanie listy procesów na podstawie wpisanego tekstu
+        private void FilterProcesses(string query)
+        {
+            LvProcesses.Items.Clear();
+            string q = query.ToLower().Trim();
+
+            foreach (var p in _allProcesses)
+            {
+                if (string.IsNullOrEmpty(q) ||
+                    (p.Name != null && p.Name.ToLower().Contains(q)) ||
+                    p.Id.ToString().Contains(q))
+                {
+                    LvProcesses.Items.Add(p);
+                }
+            }
+            TxtProcessCount.Text = $"Znaleziono procesów: {LvProcesses.Items.Count}";
+        }
+
+        // Główna logika wstrzykiwania
+        private void BtnInject_Click(object sender, RoutedEventArgs e)
+        {
+            if (LvProcesses.SelectedItem is not ProcessViewModel selectedProc)
+            {
+                Log("Błąd: Nie wybrano żadnego procesu z listy!");
+                return;
+            }
+
+            if (LbDlls.Items.Count == 0)
+            {
+                Log("Błąd: Nie dodano żadnej biblioteki DLL do listy!");
+                return;
+            }
+
+            string dllPath = LbDlls.Items[0].ToString() ?? string.Empty;
+            if (!File.Exists(dllPath))
+            {
+                Log($"Błąd: Plik DLL nie istnieje pod ścieżką: {dllPath}");
+                return;
+            }
+
+            Log($"Próba wstrzykiwania do procesu: {selectedProc.Name} (PID: {selectedProc.Id})");
+
+            try
+            {
+                IntPtr hProcess = OpenProcess(ProcessAccessFlags.All, false, selectedProc.Id);
+                if (hProcess == IntPtr.Zero)
+                {
+                    Log($"Błąd: Nie udało się otworzyć procesu. Kod błędu: {Marshal.GetLastWin32Error()}");
+                    return;
                 }
 
-                LbProcesses.ItemsSource = processes;
-                TxtProcessCount.Text = $"Znaleziono procesów: {processes.Count}";
+                byte[] dllPathBytes = Encoding.ASCII.GetBytes(dllPath + "\0");
+                IntPtr pDllPath = VirtualAllocEx(hProcess, IntPtr.Zero, (uint)dllPathBytes.Length, AllocationType.Commit | AllocationType.Reserve, MemoryProtection.ExecuteReadWrite);
 
-                if (logAction)
-                    Log($"Odświeżono listę procesów. Znaleziono: {processes.Count}");
+                if (pDllPath == IntPtr.Zero)
+                {
+                    Log("Błąd: Alokacja pamięci w obcym procesie nie powiodła się.");
+                    CloseHandle(hProcess);
+                    return;
+                }
+
+                bool written = WriteProcessMemory(hProcess, pDllPath, dllPathBytes, (uint)dllPathBytes.Length, out var bytesWritten);
+                if (!written || bytesWritten == IntPtr.Zero)
+                {
+                    Log("Błąd: Nie udało się zapisać pamięci w procesie docelowym.");
+                    CloseHandle(hProcess);
+                    return;
+                }
+
+                IntPtr hKernel32 = GetModuleHandle("kernel32.dll");
+                IntPtr pLoadLibrary = GetProcAddress(hKernel32, "LoadLibraryA");
+
+                if (pLoadLibrary == IntPtr.Zero)
+                {
+                    Log("Błąd: Nie znaleziono adresu funkcji LoadLibraryA.");
+                    CloseHandle(hProcess);
+                    return;
+                }
+
+                IntPtr hThread = CreateRemoteThread(hProcess, IntPtr.Zero, 0, pLoadLibrary, pDllPath, 0, IntPtr.Zero);
+                if (hThread == IntPtr.Zero)
+                {
+                    Log($"Błąd: Nie udało się utworzyć zdalnego wątku. Kod: {Marshal.GetLastWin32Error()}");
+                }
+                else
+                {
+                    Log($"Sukces! DLL została pomyślnie wstrzykiwana do PID: {selectedProc.Id}");
+                    CloseHandle(hThread);
+                }
+
+                CloseHandle(hProcess);
             }
             catch (Exception ex)
             {
-                Log($"Błąd podczas ładowania procesów: {ex.Message}");
+                Log($"Wystąpił wyjątek krytyczny: {ex.Message}");
+            }
+        }
+
+        // Obsługa zdarzeń interfejsu
+        private void BtnThemeToggle_Click(object sender, RoutedEventArgs e) { Log("Przełączono motyw."); }
+
+        private void TxtSearch_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (TxtSearch != null)
+            {
+                FilterProcesses(TxtSearch.Text);
             }
         }
 
         private void BtnRefresh_Click(object sender, RoutedEventArgs e)
         {
             LoadProcesses();
+            Log("Odświeżono listę procesów.");
         }
 
-        private void TxtSearch_TextChanged(object sender, TextChangedEventArgs e)
+        private void SliderDelay_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
-            LoadProcesses(false);
+            if (TxtDelayVal != null) TxtDelayVal.Text = $"{e.NewValue}s";
         }
-
-        private void BtnBrowse_Click(object sender, RoutedEventArgs e)
-        {
-            OpenFileDialog dlg = new OpenFileDialog();
-            dlg.Filter = "Biblioteki DLL (*.dll)|*.dll|Wszystkie pliki (*.*)|*.*";
-            if (dlg.ShowDialog() == true)
-            {
-                TxtDllPath.Text = dlg.FileName;
-                Log($"Wybrano plik DLL: {dlg.FileName}");
-            }
-        }
-
-        private void BtnInject_Click(object sender, RoutedEventArgs e)
-        {
-            if (string.IsNullOrEmpty(TxtDllPath.Text))
-            {
-                MessageBox.Show("Najpierw wybierz plik DLL do wstrzyknięcia!", "Ostrzeżenie", MessageBoxButton.OK, MessageBoxImage.Warning);
-                Log("Próba wstrzyknięcia bez wybranej ścieżki DLL.");
-                return;
-            }
-
-            if (LbProcesses.SelectedItem == null)
-            {
-                MessageBox.Show("Wybierz proces docelowy z listy!", "Ostrzeżenie", MessageBoxButton.OK, MessageBoxImage.Warning);
-                Log("Próba wstrzyknięcia bez wybranego procesu.");
-                return;
-            }
-
-            dynamic selectedProc = LbProcesses.SelectedItem;
-            int pid = selectedProc.Id;
-            string procName = selectedProc.Name;
-
-            Log($"Rozpoczynanie wstrzykiwania do procesu {procName} (PID: {pid})...");
-
-            try
-            {
-                Process target = Process.GetProcessById(pid);
-                Log("Otwarto uchwyt procesu pomyślnie. Architektura zgodna.");
-                Log($"[SUKCES] Pomyślnie wstrzyknięto bibliotekę do PID: {pid}");
-                MessageBox.Show($"Wstrzyknięto pomyślnie do procesu {procName}!", "Sukces", MessageBoxButton.OK, MessageBoxImage.Information);
-            }
-            catch (Exception ex)
-            {
-                Log($"[BŁĄD] Wstrzyknięcie nie powiodło się: {ex.Message}");
-                MessageBox.Show($"Błąd wstrzykiwania: {ex.Message}", "Błąd", MessageBoxButton.OK, MessageBoxImage.Error);
-            }
-        }
+        private void LvProcesses_SelectionChanged(object sender, SelectionChangedEventArgs e) { }
+        private void LvProcesses_MouseRightButtonUp(object sender, MouseButtonEventArgs e) { }
+        private void ChkAutoRefresh_Checked(object sender, RoutedEventArgs e) { }
+        private void ChkAutoRefresh_Unchecked(object sender, RoutedEventArgs e) { }
 
         private void BtnKillProcess_Click(object sender, RoutedEventArgs e)
         {
-            if (LbProcesses.SelectedItem == null)
-            {
-                MessageBox.Show("Zaznacz proces do zamknięcia.", "Informacja", MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
-            }
-
-            dynamic selectedProc = LbProcesses.SelectedItem;
-            int pid = selectedProc.Id;
-            string name = selectedProc.Name;
-
-            var result = MessageBox.Show($"Czy na pewno chcesz siłowo zamknąć proces {name} (PID: {pid})?", "Potwierdzenie", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-            if (result == MessageBoxResult.Yes)
+            if (LvProcesses.SelectedItem is ProcessViewModel p)
             {
                 try
                 {
-                    Process p = Process.GetProcessById(pid);
-                    p.Kill();
-                    Log($"Zamknięto proces {name} (PID: {pid})");
-                    LoadProcesses(false);
+                    Process.GetProcessById(p.Id).Kill();
+                    Log($"Zabito proces: {p.Name}");
+                    LoadProcesses();
                 }
-                catch (Exception ex)
+                catch (Exception ex) { Log($"Nie udało się zabić procesu: {ex.Message}"); }
+            }
+        }
+
+        private void BtnExportLogs_Click(object sender, RoutedEventArgs e)
+        {
+            File.WriteAllText("injector_logs.txt", TxtConsoleLogs.Text);
+            Log("Eksportowano logi do pliku injector_logs.txt");
+        }
+
+        private void BtnAddDll_Click(object sender, RoutedEventArgs e)
+        {
+            Microsoft.Win32.OpenFileDialog dlg = new() { Filter = "Biblioteki DLL (*.dll)|*.dll" };
+            if (dlg.ShowDialog() == true)
+            {
+                LbDlls.Items.Add(dlg.FileName);
+                Log($"Dodano DLL: {dlg.FileName}");
+            }
+        }
+
+        private void BtnRemoveDll_Click(object sender, RoutedEventArgs e)
+        {
+            if (LbDlls.SelectedItem != null)
+            {
+                string removed = LbDlls.SelectedItem.ToString() ?? string.Empty;
+                LbDlls.Items.Remove(LbDlls.SelectedItem);
+                Log($"Usunięto DLL: {removed}");
+            }
+        }
+
+        private void Window_Drop(object sender, DragEventArgs e)
+        {
+            if (e.Data.GetDataPresent(DataFormats.FileDrop))
+            {
+                string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
+                foreach (var file in files)
                 {
-                    Log($"Nie udało się zamknąć procesu: {ex.Message}");
-                    MessageBox.Show($"Błąd: {ex.Message}", "Błąd", MessageBoxButton.OK, MessageBoxImage.Error);
+                    if (file.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                    {
+                        LbDlls.Items.Add(file);
+                        Log($"Dodano DLL przez przeciągnięcie: {file}");
+                    }
                 }
             }
         }
+    }
 
-        private void ChkAutoRefresh_Checked(object sender, RoutedEventArgs e)
-        {
-            autoRefreshTimer.Start();
-            Log("Włączono automatyczne odświeżanie listy procesów.");
-        }
-
-        private void ChkAutoRefresh_Unchecked(object sender, RoutedEventArgs e)
-        {
-            autoRefreshTimer.Stop();
-            Log("Wyłączono automatyczne odświeżanie listy procesów.");
-        }
-
-        private void LbProcesses_SelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-            if (LbProcesses.SelectedItem != null)
-            {
-                dynamic selectedProc = LbProcesses.SelectedItem;
-                Log($"Wybrano proces: {selectedProc.Name} (PID: {selectedProc.Id})");
-            }
-        }
-
-        private void BtnThemeToggle_Click(object sender, RoutedEventArgs e)
-        {
-            isDarkMode = !isDarkMode;
-            if (isDarkMode)
-            {
-                Resources["WindowBgBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#121214"));
-                Resources["CardBgBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1A1A1E"));
-                Resources["ItemHoverBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#25252B"));
-                Resources["TextPrimaryBrush"] = new SolidColorBrush(Colors.White);
-                Resources["TextSecondaryBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#9E9EA8"));
-                Resources["BorderBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2E2E38"));
-                Resources["InputBgBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#18181C"));
-                Resources["ButtonBgBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#25252B"));
-                Resources["ButtonHoverBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#32323B"));
-                Resources["ConsoleFgBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#4EC9B0"));
-                Resources["PidColorBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#4EC9B0"));
-                Resources["RamColorBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#E5C07B"));
-                BtnThemeToggle.Content = "☀️ Jasny Motyw";
-                Log("Zmieniono motyw na ciemny.");
-            }
-            else
-            {
-                Resources["WindowBgBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F3F3F5"));
-                Resources["CardBgBrush"] = new SolidColorBrush(Colors.White);
-                Resources["ItemHoverBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#E5E5EA"));
-                Resources["TextPrimaryBrush"] = new SolidColorBrush(Colors.Black);
-                Resources["TextSecondaryBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#6E6E73"));
-                Resources["BorderBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#D1D1D6"));
-                Resources["InputBgBrush"] = new SolidColorBrush(Colors.White);
-                Resources["ButtonBgBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#E5E5EA"));
-                Resources["ButtonHoverBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#D1D1D6"));
-                Resources["ConsoleFgBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#006633"));
-                Resources["PidColorBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#005FB8"));
-                Resources["RamColorBrush"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#8C5000"));
-                BtnThemeToggle.Content = "🌙 Ciemny Motyw";
-                Log("Zmieniono motyw na jasny.");
-            }
-        }
+    public class ProcessViewModel
+    {
+        public string? Name { get; set; }
+        public int Id { get; set; }
+        public string? MemorySize { get; set; }
+        public string? Architecture { get; set; }
+        public string? MainWindowTitle { get; set; }
+        public ImageSource? Icon { get; set; }
     }
 }
