@@ -42,4 +42,4 @@ Jeśli chcesz samodzielnie zmodyfikować lub skompilować kod:
 
 1. Sklonuj repozytorium lub pobierz je jako ZIP:
    ```bash
-   git clone [https://github.com/TwojLogin/ModernInjector.git](https://github.com/TwojLogin/ModernInjector.git)
+   git clone [https://github.com/HMpower1/ModernInjector.git](https://github.com/HMpower1/ModernInjector.git)
